@@ -1,0 +1,199 @@
+#!/system/bin/sh
+
+pm disable com.android.systemui
+pm disable com.aosp.barebone.launcher
+pm enable com.barebone.background
+
+#!/system/bin/sh
+#
+# mount ext partition from sd card
+
+BB="logwrapper busybox";
+
+if [ "$SD_EXT_DIRECTORY" = "" ];
+then
+    SD_EXT_DIRECTORY=/sd-ext;
+fi;
+
+# find SD Card
+for MMC_NUM in `seq 0 9`;
+do
+    MMC_TYPE=`cat /sys/block/mmcblk$MMC_NUM/device/type`
+    if [ "$MMC_TYPE" = "SD" ];
+    then
+        # 2nd partition of sdcard should be the sd-ext if exist
+        SD_EXT_PART=/dev/block/mmcblk${MMC_NUM}p2
+        break
+    fi
+done
+
+if [ -b "$SD_EXT_PART" ];
+then
+    log -p i -t mountsd "Checking filesystems..";
+
+    # fsck the sdcard filesystem first
+    if [ -x `which e2fsck` ];
+    then
+        e2fsck -y $SD_EXT_PART
+        e2fsk_exitcode=$?
+    else
+        echo "executable e2fsck not found, assuming no filesystem errors"
+        e2fsk_exitcode=0
+    fi
+
+    # set property with exit code in case an error occurs
+    setprop cm.e2fsck.errors $e2fsk_exitcode;
+    if [ "$e2fsk_exitcode" -lt 2 ];
+    then
+        # mount and set perms
+        $BB mount -o noatime,nodiratime,barrier=1 -t ext3 $SD_EXT_PART $SD_EXT_DIRECTORY;
+        if [ "$?" = 0 ];
+        then
+            $BB chown 1000:1000 $SD_EXT_DIRECTORY;
+            $BB chmod 771 $SD_EXT_DIRECTORY;
+            log -p i -t mountsd "$SD_EXT_DIRECTORY successfully mounted";
+        else
+            log -p e -t mountsd "Unable to mount filesystem for $SD_EXT_DIRECTORY!";
+        fi
+    else
+        log -p e -t mountsd "Unable to repair filesystem, disabling apps2sd";
+    fi
+fi
+
+# =====================
+# I/O related tweaks 
+# =====================
+
+MMC=`ls -d /sys/block/mmc*`;
+
+
+#I/O scheduler
+for i in $MMC;
+do
+	echo "sio" > $i/queue/scheduler; 
+done;
+
+# Optimize non-rotating storage; 
+for i in $MMC;
+do
+	#IMPORTANT!
+	if [ -e $i/queue/rotational ]; 
+	then
+		echo 0 > $i/queue/rotational; 
+	fi;
+	if [ -e $i/queue/nr_requests ];
+	then
+		echo 8192 > $i/queue/nr_requests; # for starters: keep it sane
+	fi;
+	
+	# deadline/VR/SIO scheduler specific
+	if [ -e $i/queue/iosched/fifo_batch ];
+	then
+		echo 1 > $i/queue/iosched/fifo_batch;
+	fi;
+	if [ -e $i/queue/iosched/writes_starved ];
+	then
+		echo 1 > $i/queue/iosched/writes_starved;
+	fi;
+	
+#disable iostats to reduce overhead  # idea by kodos96 - thanks !
+	if [ -e $i/queue/iostats ];
+	then
+		echo "0" > $i/queue/iostats;
+	fi;
+# Optimize for read- & write-throughput; 
+# Optimize for readahead; 
+	if [ -e $i/queue/read_ahead_kb ];
+	then
+		echo "256" >  $i/queue/read_ahead_kb;
+	fi;
+	
+done;
+
+
+
+# ===================================================================================
+# TWEAKS: raising read_ahead_kb cache-value for mounts that are sdcard-like to 2048
+# ===================================================================================
+
+if [ -e /sys/devices/virtual/bdi/179:0/read_ahead_kb ];
+then
+    echo "2048" > /sys/devices/virtual/bdi/179:0/read_ahead_kb;
+fi;
+
+
+if [ -e /sys/devices/virtual/bdi/179:32/read_ahead_kb ];
+  then
+    echo "256" > /sys/devices/virtual/bdi/179:32/read_ahead_kb;
+fi;
+
+if [ -e /sys/devices/virtual/bdi/default/read_ahead_kb ];
+  then
+    echo "256" > /sys/devices/virtual/bdi/default/read_ahead_kb;
+fi;
+
+
+
+# ========================================
+# Mount related tweaks (Applied globally)
+# ========================================
+
+# Remount all partitions with noatime
+for k in $(busybox mount | grep relatime | cut -d " " -f3);
+do
+
+busybox mount -o remount,noatime $k;
+done;
+
+
+# ==============================================================
+# VFS, VM settings
+# ==============================================================
+
+echo 3 > /proc/sys/vm/page-cluster;
+echo 3000 > /proc/sys/vm/dirty_expire_centisecs;
+echo 500 > /proc/sys/vm/dirty_writeback_centisecs;
+echo "5120" > /proc/sys/vm/min_free_kbytes;
+echo "0" > /proc/sys/vm/oom_kill_allocating_task;
+echo "0" > /proc/sys/vm/panic_on_oom;
+echo "10" > /proc/sys/vm/dirty_background_ratio;
+echo "40" > /proc/sys/vm/dirty_ratio;
+echo "10" > /proc/sys/vm/vfs_cache_pressure;
+echo "1" > /proc/sys/vm/overcommit_memory;
+echo "4" > /proc/sys/vm/min_free_order_shift;
+echo "0" > /proc/sys/vm/laptop_mode;
+echo "0" > /proc/sys/vm/block_dump;
+echo "1" > /proc/sys/vm/oom_dump_tasks;
+
+
+# ===================
+# Kernel | FS Tweaks
+# ===================
+
+echo "500 512000 64 2048" > /proc/sys/kernel/sem;
+echo "268435456" > /proc/sys/kernel/shmmax;
+echo "2097152" > /proc/sys/kernel/shmall;
+echo "4096" > /proc/sys/kernel/shmmni;
+echo "2048" > /proc/sys/kernel/msgmni;
+echo "64000" > /proc/sys/kernel/msgmax;
+echo "30" > /proc/sys/kernel/panic;
+echo "0" > /proc/sys/kernel/panic_on_oops;
+echo "5000" > /proc/sys/kernel/threads-max;
+echo "10" > /proc/sys/fs/lease-break-time;
+echo "65536" > /proc/sys/fs/file-max;
+
+
+# ==========
+# Ondemand
+# ==========
+	if [ -e /sys/devices/system/cpu/cpu0/cpufreq/ondemand/up_threshold ]; then
+		echo "85" > /sys/devices/system/cpu/cpu0/cpufreq/ondemand/up_threshold;
+	fi;
+	
+	if [ -e /sys/devices/system/cpu/cpu1/cpufreq/ondemand/up_threshold ]; then
+		echo "85" > /sys/devices/system/cpu/cpu1/cpufreq/ondemand/up_threshold;
+	fi;
+	
+	if [ -e /sys/devices/system/cpu/cpufreq/ondemand/up_threshold ]; then
+		echo "85" > /sys/devices/system/cpu/cpufreq/ondemand/up_threshold;
+	fi;
